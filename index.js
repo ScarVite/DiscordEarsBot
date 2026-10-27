@@ -42,10 +42,11 @@ function sleep(ms) {
 
 async function convert_audio(input) {
     try {
-        // stereo to mono channel
-        const data = new Int16Array(input)
-        const ndata = data.filter((el, idx) => idx % 2);
-        return Buffer.from(ndata);
+        // stereo to mono channel: keep the left 16-bit sample of each 4-byte frame
+        const ndata = Buffer.alloc(input.length / 2);
+        for (let i = 0; i + 1 < input.length; i += 4)
+            input.copy(ndata, i / 2, i, i + 2);
+        return ndata;
     } catch (e) {
         console.log(e)
         console.log('convert_audio: ' + e)
@@ -188,7 +189,7 @@ discordClient.on('messageCreate', async (msg) => {
         if (!('guild' in msg) || !msg.guild) return; // prevent private messages to bot
         const mapKey = msg.guild.id;
         if (msg.content.trim().toLowerCase() == _CMD_JOIN) {
-            if (!msg.member.voice.channel.id) {
+            if (!msg.member.voice.channel?.id) {
                 msg.reply('Error: please join a voice channel first.')
             } else {
                 if (!guildMap.has(mapKey))
@@ -199,8 +200,7 @@ discordClient.on('messageCreate', async (msg) => {
         } else if (msg.content.trim().toLowerCase() == _CMD_LEAVE) {
             if (guildMap.has(mapKey)) {
                 let val = guildMap.get(mapKey);
-                if (val.voice_Channel) val.voice_Channel.leave()
-                if (val.voice_Connection) val.voice_Connection.disconnect()
+                if (val.voice_Connection) val.voice_Connection.destroy();
                 guildMap.delete(mapKey)
                 msg.reply("Disconnected.")
             } else {
@@ -308,8 +308,8 @@ if (SPEECH_METHOD === 'vosk') {
 
 function speak_impl(voice_Connection, mapKey) {
   const receiver = voice_Connection.receiver;
-  receiver.speaking.on('start', async (userId) => { 
-    const user = discordClient.users.cache.get(userId)
+  receiver.speaking.on('start', async (userId) => {
+    if (receiver.subscriptions.has(userId)) return; // already recording this user
     const audioStream = receiver.subscribe(userId, {
       end: {
         behavior: EndBehaviorType.AfterSilence,
@@ -337,9 +337,9 @@ function speak_impl(voice_Connection, mapKey) {
         let new_buffer = await convert_audio(buffer)
         let out = await transcribe(new_buffer, mapKey);
         if (out != null)
-            process_commands_query(out, mapKey, user);
+            process_commands_query(out, mapKey, await discordClient.users.fetch(userId));
       } catch (e) {
-          console.log('tmpraw rename: ' + e)
+          console.log('transcribe: ' + e)
       }
     }); 
 
