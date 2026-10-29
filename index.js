@@ -17,7 +17,7 @@ const util = require('util');
 const { Readable } = require('stream');
 const { OpusEncoder } = require('@discordjs/opus');
 const https = require('https')
-const { Client, IntentsBitField } = require('discord.js')
+const { Client, IntentsBitField, PermissionsBitField } = require('discord.js')
 const { joinVoiceChannel, EndBehaviorType } = require('@discordjs/voice');
 const { spawn } = require('child_process');
 const readline = require('readline');
@@ -229,7 +229,10 @@ discordClient.on('messageCreate', async (msg) => {
             msg.reply('hello back =)')
         }
         else if (msg.content.trim().toLowerCase() == _CMD_STATUS) {
-            msg.reply(await get_status(mapKey))
+            if (!msg.member?.permissions.has(PermissionsBitField.Flags.Administrator))
+                msg.reply('Error: only server administrators can use this command.')
+            else
+                msg.reply(await get_status(mapKey))
         }
         else if (msg.content.split('\n')[0].split(' ')[0].trim().toLowerCase() == _CMD_LANG) {
             if (SPEECH_METHOD === 'witai') {
