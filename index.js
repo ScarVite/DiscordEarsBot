@@ -187,6 +187,7 @@ const _CMD_LEAVE       = PREFIX + 'leave';
 const _CMD_DEBUG       = PREFIX + 'debug';
 const _CMD_TEST        = PREFIX + 'hello';
 const _CMD_LANG        = PREFIX + 'lang';
+const _CMD_STATUS      = PREFIX + 'status';
 
 const guildMap = new Map();
 
@@ -227,6 +228,9 @@ discordClient.on('messageCreate', async (msg) => {
         else if (msg.content.trim().toLowerCase() == _CMD_TEST) {
             msg.reply('hello back =)')
         }
+        else if (msg.content.trim().toLowerCase() == _CMD_STATUS) {
+            msg.reply(await get_status(mapKey))
+        }
         else if (msg.content.split('\n')[0].split(' ')[0].trim().toLowerCase() == _CMD_LANG) {
             if (SPEECH_METHOD === 'witai') {
               const lang = msg.content.replace(_CMD_LANG, '').trim().toLowerCase()
@@ -262,6 +266,7 @@ function getHelpString() {
         out += PREFIX + 'join\n';
         out += PREFIX + 'leave\n';
         out += PREFIX + 'lang <code>\n';
+        out += PREFIX + 'status\n';
         out += '```'
     return out;
 }
@@ -317,10 +322,13 @@ if (SPEECH_METHOD === 'vosk') {
 // faster-whisper runs in one long-lived Python process so the model stays warm and Node never blocks
 let whisper = null;
 let whisper_next_id = 0;
+let whisper_started_at = null;
+let whisper_restarts = 0;
 const whisper_pending = new Map();
 function start_whisper() {
   const python = process.env.WHISPER_PYTHON || (fs.existsSync('.venv/bin/python') ? '.venv/bin/python' : 'python3');
   whisper = spawn(python, ['whisper_worker.py'], { stdio: ['pipe', 'pipe', 'inherit'] });
+  whisper_started_at = Date.now();
   whisper.on('error', e => console.log('whisper worker: ' + e));
   whisper.stdin.on('error', e => console.log('whisper stdin: ' + e));
   readline.createInterface({ input: whisper.stdout }).on('line', line => {
@@ -334,25 +342,65 @@ function start_whisper() {
     console.log('whisper worker exited (' + code + '), restarting in 5s');
     for (const resolve of whisper_pending.values()) resolve({ error: 'worker exited' });
     whisper_pending.clear();
+    whisper_restarts++;
     setTimeout(start_whisper, 5000);
   });
 }
 if (SPEECH_METHOD === 'whisper') start_whisper();
 
-async function transcribe_whisper(buffer, lang) {
-  if (!whisper.stdin.writable) return null;
-  const res = await new Promise(resolve => {
+function whisper_request(header, buffer = Buffer.alloc(0)) {
+  return new Promise(resolve => {
     const id = whisper_next_id++;
     whisper_pending.set(id, resolve);
-    whisper.stdin.write(JSON.stringify({ id, lang, bytes: buffer.length }) + '\n');
+    whisper.stdin.write(JSON.stringify({ id, ...header, bytes: buffer.length }) + '\n');
     whisper.stdin.write(buffer);
   });
+}
+
+async function transcribe_whisper(buffer, lang) {
+  if (!whisper.stdin.writable) return null;
+  const res = await whisper_request({ lang }, buffer);
   if (res.error) {
     console.log('whisper error: ' + res.error);
     return null;
   }
   console.log('whisper:', res.text);
   return res.text;
+}
+
+async function get_status(mapKey) {
+  const val = guildMap.get(mapKey);
+  const lang = val ? val.selected_lang : 'en';
+  let out = '**Speech method:** ' + SPEECH_METHOD + '\n';
+  out += '**Language:** ' + lang + (val ? '' : ' (not connected)') + '\n';
+  out += '**Bot RAM:** ' + Math.round(process.memoryUsage().rss / 1048576) + ' MB\n';
+  if (SPEECH_METHOD === 'whisper') {
+    const up = whisper.exitCode === null && whisper.stdin.writable;
+    out += '**Worker:** ' + (up ? 'running' : 'NOT running (check pm2 logs)') + ', pid ' + whisper.pid
+      + ', up ' + Math.round((Date.now() - whisper_started_at) / 60000) + ' min, restarts ' + whisper_restarts
+      + ', queued clips ' + whisper_pending.size + '\n';
+    if (!up) return out;
+    const sent = Date.now();
+    // waits behind queued clips, so the timing reflects real load; first start may still be loading the model
+    const res = await Promise.race([
+      whisper_request({ status: true }),
+      sleep(20000).then(() => ({ error: 'no reply in 20 s (model still loading, or worker stuck)' })),
+    ]);
+    if (res.error) return out + '**Self-test:** FAILED: ' + res.error;
+    out += '**Model:** ' + res.model + ' (' + res.compute_type + ', ' + res.cpu_threads + ' threads)'
+      + (res.peak_rss_mb ? ', worker peak RAM ' + res.peak_rss_mb + ' MB' : '') + '\n';
+    out += '**Self-test:** OK, 1 s test clip decoded in ' + res.infer_ms + ' ms (round trip ' + (Date.now() - sent) + ' ms)';
+  } else if (SPEECH_METHOD === 'vosk') {
+    let model = 'unknown';
+    try { model = fs.readFileSync('vosk_models/en/README', 'utf8').split('\n')[0].trim() } catch (e) {}
+    out += '**Model:** ' + model + ' (loaded: ' + Object.keys(recs).join(', ') + ')\n';
+    if (!recs[lang]) return out + '**Self-test:** FAILED: no Vosk model loaded for "' + lang + '"';
+    const sent = Date.now();
+    recs[lang].acceptWaveform(Buffer.alloc(32000)); // 1 s of 16 kHz silence
+    recs[lang].finalResult();
+    out += '**Self-test:** OK, 1 s test clip decoded in ' + (Date.now() - sent) + ' ms';
+  }
+  return out;
 }
 
 function speak_impl(voice_Connection, mapKey) {

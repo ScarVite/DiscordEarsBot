@@ -35,5 +35,13 @@
   "overrides": {
     "ffi-napi": "npm:@napi-ffi/ffi-napi@4.0.7",
     "ref-napi": "npm:@napi-ffi/ref-napi@3.0.9"
+  },
+  "allowScripts": {
+    "protobufjs@7.2.5": true,
+    "@discordjs/opus@0.10.0": true,
+    "@napi-ffi/get-symbol-from-current-process-h@1.0.4": true,
+    "@napi-ffi/ref-napi@3.0.9": true,
+    "@napi-ffi/get-uv-event-loop-napi-h@1.0.6": true,
+    "@napi-ffi/ffi-napi@4.0.7": true
   }
 }
