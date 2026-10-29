@@ -19,7 +19,8 @@ const { OpusEncoder } = require('@discordjs/opus');
 const https = require('https')
 const { Client, IntentsBitField } = require('discord.js')
 const { joinVoiceChannel, EndBehaviorType } = require('@discordjs/voice');
-const vosk = require('vosk');
+const { spawn } = require('child_process');
+const readline = require('readline');
 const witClient = require('node-witai-speech');
 const gspeech = require('@google-cloud/speech');
 
@@ -42,10 +43,16 @@ function sleep(ms) {
 
 async function convert_audio(input) {
     try {
-        // stereo to mono channel: keep the left 16-bit sample of each 4-byte frame
-        const ndata = Buffer.alloc(input.length / 2);
-        for (let i = 0; i + 1 < input.length; i += 4)
-            input.copy(ndata, i / 2, i, i + 2);
+        // 48kHz 16-bit stereo -> 16kHz 16-bit mono: average L+R over each group of 3 frames (12 bytes);
+        // the 3-frame box average doubles as a cheap anti-aliasing filter for the 3x decimation
+        const frames = Math.floor(input.length / 12);
+        const ndata = Buffer.alloc(frames * 2);
+        for (let i = 0; i < frames; i++) {
+            let sum = 0;
+            for (let b = i * 12; b < i * 12 + 12; b += 2)
+                sum += input.readInt16LE(b);
+            ndata.writeInt16LE(Math.round(sum / 6), i * 2);
+        }
         return ndata;
     } catch (e) {
         console.log(e)
@@ -66,7 +73,7 @@ const SETTINGS_FILE = 'settings.json';
 
 let DISCORD_TOK = null;
 let WITAI_TOK = null; 
-let SPEECH_METHOD = 'vosk'; // witai, google, vosk
+let SPEECH_METHOD = 'whisper'; // witai, google, vosk, whisper
 
 function loadConfig() {
     if (fs.existsSync(SETTINGS_FILE)) {
@@ -79,7 +86,7 @@ function loadConfig() {
     WITAI_TOK = process.env.WITAI_TOK || WITAI_TOK;
     SPEECH_METHOD = process.env.SPEECH_METHOD || SPEECH_METHOD;
 
-    if (!['witai', 'google', 'vosk'].includes(SPEECH_METHOD))
+    if (!['witai', 'google', 'vosk', 'whisper'].includes(SPEECH_METHOD))
         throw 'invalid or missing SPEECH_METHOD'
     if (!DISCORD_TOK)
         throw 'invalid or missing DISCORD_TOK'
@@ -235,7 +242,7 @@ discordClient.on('messageCreate', async (msg) => {
                   })
                 }
               })
-            } else if (SPEECH_METHOD === 'vosk') {
+            } else if (SPEECH_METHOD === 'vosk' || SPEECH_METHOD === 'whisper') {
               let val = guildMap.get(mapKey);
               const lang = msg.content.replace(_CMD_LANG, '').trim().toLowerCase()
               val.selected_lang = lang;
@@ -295,15 +302,57 @@ async function connect(msg, mapKey) {
 
 let recs = {}
 if (SPEECH_METHOD === 'vosk') {
+  const vosk = require('vosk'); // loaded only when chosen, so whisper setups skip the native ffi bindings
   vosk.setLogLevel(-1);
   // MODELS: https://alphacephei.com/vosk/models
   recs = {
-    'en': new vosk.Recognizer({model: new vosk.Model('vosk_models/en'), sampleRate: 48000}),
-    // 'fr': new vosk.Recognizer({model: new vosk.Model('vosk_models/fr'), sampleRate: 48000}),
-    // 'es': new vosk.Recognizer({model: new vosk.Model('vosk_models/es'), sampleRate: 48000}),
+    'en': new vosk.Recognizer({model: new vosk.Model('vosk_models/en'), sampleRate: 16000}),
+    // 'fr': new vosk.Recognizer({model: new vosk.Model('vosk_models/fr'), sampleRate: 16000}),
+    // 'es': new vosk.Recognizer({model: new vosk.Model('vosk_models/es'), sampleRate: 16000}),
   }
   // download new models if you need
   // dev reference: https://github.com/alphacep/vosk-api/blob/master/nodejs/index.js
+}
+
+// faster-whisper runs in one long-lived Python process so the model stays warm and Node never blocks
+let whisper = null;
+let whisper_next_id = 0;
+const whisper_pending = new Map();
+function start_whisper() {
+  const python = process.env.WHISPER_PYTHON || (fs.existsSync('.venv/bin/python') ? '.venv/bin/python' : 'python3');
+  whisper = spawn(python, ['whisper_worker.py'], { stdio: ['pipe', 'pipe', 'inherit'] });
+  whisper.on('error', e => console.log('whisper worker: ' + e));
+  whisper.stdin.on('error', e => console.log('whisper stdin: ' + e));
+  readline.createInterface({ input: whisper.stdout }).on('line', line => {
+    let res;
+    try { res = JSON.parse(line) } catch (e) { return console.log('whisper: ' + line) }
+    const resolve = whisper_pending.get(res.id);
+    whisper_pending.delete(res.id);
+    if (resolve) resolve(res);
+  });
+  whisper.on('exit', code => {
+    console.log('whisper worker exited (' + code + '), restarting in 5s');
+    for (const resolve of whisper_pending.values()) resolve({ error: 'worker exited' });
+    whisper_pending.clear();
+    setTimeout(start_whisper, 5000);
+  });
+}
+if (SPEECH_METHOD === 'whisper') start_whisper();
+
+async function transcribe_whisper(buffer, lang) {
+  if (!whisper.stdin.writable) return null;
+  const res = await new Promise(resolve => {
+    const id = whisper_next_id++;
+    whisper_pending.set(id, resolve);
+    whisper.stdin.write(JSON.stringify({ id, lang, bytes: buffer.length }) + '\n');
+    whisper.stdin.write(buffer);
+  });
+  if (res.error) {
+    console.log('whisper error: ' + res.error);
+    return null;
+  }
+  console.log('whisper:', res.text);
+  return res.text;
 }
 
 function speak_impl(voice_Connection, mapKey) {
@@ -313,13 +362,19 @@ function speak_impl(voice_Connection, mapKey) {
     const audioStream = receiver.subscribe(userId, {
       end: {
         behavior: EndBehaviorType.AfterSilence,
-        duration: 1000,
+        duration: 600,
       },
     });
 
     const encoder = new OpusEncoder(48000, 2);
-    let buffer  = []; 
-    audioStream.on("data", chunk => { buffer.push( encoder.decode( chunk ) ) }); 
+    let buffer  = [];
+    audioStream.on("data", chunk => {
+      try {
+        buffer.push( encoder.decode( chunk ) )
+      } catch (e) {
+        console.log('opus decode: ' + e) // drop the corrupt packet, keep the utterance
+      }
+    });
     audioStream.once("end", async () => { 
       
       buffer = Buffer.concat(buffer)
@@ -365,9 +420,13 @@ async function transcribe(buffer, mapKey) {
   } else if (SPEECH_METHOD === 'vosk') {
       let val = guildMap.get(mapKey);
       recs[val.selected_lang].acceptWaveform(buffer);
-      let ret = recs[val.selected_lang].result().text;
+      // finalResult() flushes and resets the recognizer, so trailing words don't bleed into the next utterance
+      let ret = recs[val.selected_lang].finalResult().text;
       console.log('vosk:', ret)
       return ret;
+  } else if (SPEECH_METHOD === 'whisper') {
+      let val = guildMap.get(mapKey);
+      return transcribe_whisper(buffer, val.selected_lang)
   }
 }
 
@@ -392,7 +451,7 @@ async function transcribe_witai(buffer) {
         console.log('transcribe_witai')
         const extractSpeechIntent = util.promisify(witClient.extractSpeechIntent);
         var stream = Readable.from(buffer);
-        const contenttype = "audio/raw;encoding=signed-integer;bits=16;rate=48k;endian=little"
+        const contenttype = "audio/raw;encoding=signed-integer;bits=16;rate=16k;endian=little"
         const output = await extractSpeechIntent(WITAI_TOK, stream, contenttype)
         witAI_lastcallTS = Math.floor(new Date());
         console.log(output)
@@ -421,7 +480,7 @@ async function transcribe_gspeech(buffer) {
       };
       const config = {
         encoding: 'LINEAR16',
-        sampleRateHertz: 48000,
+        sampleRateHertz: 16000,
         languageCode: 'en-US',  // https://cloud.google.com/speech-to-text/docs/languages
       };
       const request = {
